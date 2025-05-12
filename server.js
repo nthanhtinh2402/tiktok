@@ -142,6 +142,10 @@ const fetchWithProxy = async (videoUrl) => {
   }
 };
 
+// Hàm mã hóa và giải mã Base64
+const encodeBase64 = (str) => Buffer.from(str).toString('base64');
+const decodeBase64 = (str) => Buffer.from(str, 'base64').toString('utf-8');
+
 // Route trả về thông tin video
 app.get('/video', async (req, res) => {
   const videoUrl = req.query.url;
@@ -161,8 +165,11 @@ app.get('/video', async (req, res) => {
     const cacheId = uuidv4();
     urlCache.set(cacheId, { videoUrl, streamUrl });
 
-    // Tạo link download đầy đủ
-    const linkDownload = `${req.protocol}://${req.headers.host}/stream/${cacheId}`;
+    // Mã hóa cacheId
+    const encodedCacheId = encodeBase64(cacheId);
+
+    // Tạo link download đầy đủ với cacheId đã mã hóa
+    const linkDownload = `${req.protocol}://${req.headers.host}/stream/${encodedCacheId}`;
 
     return res.json({ id, title, thumbnail, cacheId, linkDownload });
   } catch (ytDlpError) {
@@ -172,8 +179,11 @@ app.get('/video', async (req, res) => {
       const cacheId = uuidv4();
       urlCache.set(cacheId, { videoUrl, streamUrl: null });
 
-      // Tạo link download đầy đủ
-      const linkDownload = `${req.protocol}://${req.headers.host}/stream/${cacheId}`;
+      // Mã hóa cacheId
+      const encodedCacheId = encodeBase64(cacheId);
+
+      // Tạo link download đầy đủ với cacheId đã mã hóa
+      const linkDownload = `${req.protocol}://${req.headers.host}/stream/${encodedCacheId}`;
 
       return res.json({ id, title, thumbnail, cacheId, linkDownload });
     } catch (proxyError) {
@@ -194,21 +204,37 @@ app.get('/video', async (req, res) => {
 
 // Route trả về link ảo khi nhấn Download
 app.get('/get-stream/:id', async (req, res) => {
-  const id = req.params.id;
+  const encodedId = req.params.id;
+  let id;
+  try {
+    id = decodeBase64(encodedId);
+  } catch (error) {
+    console.error('[Main] Invalid Base64 ID:', encodedId);
+    return res.status(400).json({ error: 'INVALID_ENCODED_ID' });
+  }
+
   const entry = urlCache.get(id);
 
   if (!entry) {
     return res.status(404).json({ error: 'VIRTUAL_LINK_NOT_FOUND' });
   }
 
-  // Tạo link ảo đầy đủ dựa trên hostname và protocol của server
-  const virtualLink = `${req.protocol}://${req.headers.host}/stream/${id}`;
+  // Tạo link ảo đầy đủ với cacheId đã mã hóa
+  const virtualLink = `${req.protocol}://${req.headers.host}/stream/${encodedId}`;
   return res.json({ streamUrl: virtualLink });
 });
 
 // Route stream video từ link ảo
 app.get('/stream/:id', async (req, res) => {
-  const id = req.params.id;
+  const encodedId = req.params.id;
+  let id;
+  try {
+    id = decodeBase64(encodedId);
+  } catch (error) {
+    console.error('[Main] Invalid Base64 ID:', encodedId);
+    return res.status(400).json({ error: 'INVALID_ENCODED_ID' });
+  }
+
   const entry = urlCache.get(id);
 
   if (!entry) {
