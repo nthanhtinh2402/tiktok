@@ -1,16 +1,15 @@
 import express from 'express';
 import axios from 'axios';
 import { exec } from 'child_process';
-import { readFileSync, existsSync } from 'fs';
+import { readFileSync, existsSync, writeFileSync, readFile, unlink, readdir, stat, mkdirSync } from 'fs';
 import { fileURLToPath } from 'url';
 import { dirname, join } from 'path';
-import pkg from 'uuid';
+import { v4 as uuidv4 } from 'uuid';
 import dotenv from 'dotenv';
+import rateLimit from 'express-rate-limit';
 
 // Load biến môi trường từ file .env
 dotenv.config();
-
-const { v4: uuidv4 } = pkg;
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -21,11 +20,19 @@ const port = process.env.PORT || 5000;
 // Cấu hình
 const TIKTOK_USER_AGENT = process.env.TIKTOK_USER_AGENT;
 const COOKIES_PATH = join(__dirname, process.env.COOKIES_PATH);
-const API_PATH_URL = process.env.API_PATH_URL || '/video'; // Sử dụng API_PATH_URL từ .env
-const STREAM_PATH_URL = process.env.STREAM_PATH_URL || '/stream'; // Sử dụng STREAM_PATH_URL từ .env
+const API_PATH_URL = process.env.API_PATH_URL || '/video';
+const STREAM_PATH_URL = process.env.STREAM_PATH_URL || '/stream';
+const CACHE_DIR = join(__dirname, process.env.CACHE_DIR || 'cache');
+const CACHE_EXPIRY_MINUTES = parseInt(process.env.CACHE_EXPIRY_MINUTES) || 5;
+const MAX_CONCURRENT_REQUESTS = parseInt(process.env.MAX_CONCURRENT_REQUESTS) || 100;
+const RATE_LIMIT_MAX = parseInt(process.env.RATE_LIMIT_MAX) || 50;
+const RATE_LIMIT_WINDOW_MINUTES = parseInt(process.env.RATE_LIMIT_WINDOW_MINUTES) || 15;
 
-// Lưu trữ ánh xạ id -> { videoUrl, streamUrl } (bộ nhớ tạm)
-const urlCache = new Map();
+// Tạo thư mục cache nếu chưa tồn tại
+if (!existsSync(CACHE_DIR)) {
+  mkdirSync(CACHE_DIR);
+  console.log('[CONFIG] Created cache directory:', CACHE_DIR);
+}
 
 // Phục vụ file tĩnh (index.html)
 app.use(express.static(__dirname));
@@ -35,6 +42,46 @@ if (!existsSync(COOKIES_PATH)) {
   console.error('[CONFIG] Cookies file not found:', COOKIES_PATH);
   process.exit(1);
 }
+
+// Bộ đếm yêu cầu đồng thời
+let concurrentRequests = 0;
+
+// Middleware giới hạn yêu cầu đồng thời
+const concurrentLimitMiddleware = (req, res, next) => {
+  if (concurrentRequests >= MAX_CONCURRENT_REQUESTS) {
+    console.log('[CONCURRENT] Too many concurrent requests:', concurrentRequests);
+    return res.status(429).json({ error: 'TOO_MANY_CONCURRENT_REQUESTS', details: `Maximum ${MAX_CONCURRENT_REQUESTS} concurrent requests reached` });
+  }
+  concurrentRequests++;
+  console.log('[CONCURRENT] Current concurrent requests:', concurrentRequests);
+
+  // Giảm bộ đếm khi yêu cầu hoàn tất hoặc gặp lỗi
+  res.on('finish', () => {
+    concurrentRequests--;
+    console.log('[CONCURRENT] Request finished, current concurrent requests:', concurrentRequests);
+  });
+  res.on('error', () => {
+    concurrentRequests--;
+    console.log('[CONCURRENT] Request errored, current concurrent requests:', concurrentRequests);
+  });
+
+  next();
+};
+
+// Middleware giới hạn tốc độ theo IP
+const rateLimiter = rateLimit({
+  windowMs: RATE_LIMIT_WINDOW_MINUTES * 60 * 1000, // Thời gian cửa sổ (phút)
+  max: RATE_LIMIT_MAX, // Số yêu cầu tối đa mỗi IP
+  message: {
+    error: 'RATE_LIMIT_EXCEEDED',
+    details: `Too many requests from this IP, please try again after ${RATE_LIMIT_WINDOW_MINUTES} minutes`,
+  },
+  standardHeaders: true, // Trả về header RateLimit
+  legacyHeaders: false,
+});
+
+// Áp dụng rate limiter cho route /stream/:id
+app.use(STREAM_PATH_URL + '/:id', rateLimiter);
 
 // Hàm parse cookie từ file Netscape format
 const parseCookies = (filePath) => {
@@ -82,7 +129,7 @@ const retry = async (fn, retries = process.env.RETRY_ATTEMPTS || 2, delay = proc
 const fetchWithYTDLP = async (videoUrl) => {
   return new Promise((resolve, reject) => {
     const command = [
-      process.env.YTDLP_COMMAND,  // Lấy từ biến môi trường
+      process.env.YTDLP_COMMAND,
       '--dump-json',
       `"${videoUrl}"`,
       '--no-warnings',
@@ -153,6 +200,96 @@ const fetchWithProxy = async (videoUrl) => {
 const encodeBase64 = (str) => Buffer.from(str).toString('base64');
 const decodeBase64 = (str) => Buffer.from(str, 'base64').toString('utf-8');
 
+// Hàm lưu cache vào file
+const saveCache = (cacheId, data) => {
+  const filePath = join(CACHE_DIR, `${cacheId}.json`);
+  const cacheData = {
+    ...data,
+    timestamp: Date.now(),
+  };
+  try {
+    writeFileSync(filePath, JSON.stringify(cacheData));
+    console.log('[CACHE] Saved cache:', filePath);
+  } catch (error) {
+    console.error('[CACHE] Failed to save cache:', error.message);
+  }
+};
+
+// Hàm đọc cache từ file
+const getCache = (cacheId, callback) => {
+  const filePath = join(CACHE_DIR, `${cacheId}.json`);
+  readFile(filePath, 'utf-8', (err, data) => {
+    if (err) {
+      console.error('[CACHE] Cache not found:', filePath);
+      callback(null);
+      return;
+    }
+    try {
+      const parsed = JSON.parse(data);
+      callback(parsed);
+    } catch (error) {
+      console.error('[CACHE] Failed to parse cache:', error.message);
+      callback(null);
+    }
+  });
+};
+
+// Hàm xóa file cache
+const deleteCache = (cacheId) => {
+  const filePath = join(CACHE_DIR, `${cacheId}.json`);
+  if (existsSync(filePath)) {
+    unlink(filePath, (err) => {
+      if (err) {
+        console.error('[CACHE] Failed to delete cache:', filePath, err.message);
+      } else {
+        console.log('[CACHE] Deleted cache:', filePath);
+      }
+    });
+  }
+};
+
+// Hàm dọn dẹp cache hết hạn
+const cleanupCache = () => {
+  readdir(CACHE_DIR, (err, files) => {
+    if (err) {
+      console.error('[CACHE] Failed to read_bitmap: cache directory:', err.message);
+      return;
+    }
+
+    const expiryMs = CACHE_EXPIRY_MINUTES * 60 * 1000;
+    const now = Date.now();
+
+    files.forEach((file) => {
+      const filePath = join(CACHE_DIR, file);
+      stat(filePath, (err, stats) => {
+        if (err) {
+          console.error('[CACHE] Failed to stat file:', filePath, err.message);
+          return;
+        }
+
+        readFile(filePath, 'utf-8', (err, data) => {
+          if (err) {
+            console.error('[CACHE] Failed to read cache file:', filePath, err.message);
+            return;
+          }
+
+          try {
+            const cacheData = JSON.parse(data);
+            if (now - cacheData.timestamp > expiryMs) {
+              deleteCache(file.replace('.json', ''));
+            }
+          } catch (error) {
+            console.error('[CACHE] Failed to parse cache file:', filePath, error.message);
+          }
+        });
+      });
+    });
+  });
+};
+
+// Chạy cleanup mỗi 5 phút
+setInterval(cleanupCache, 5 * 60 * 1000);
+
 // Route trả về thông tin video
 app.get(API_PATH_URL, async (req, res) => {
   const videoUrl = req.query.url;
@@ -170,7 +307,7 @@ app.get(API_PATH_URL, async (req, res) => {
 
     // Tạo mã định danh duy nhất
     const cacheId = uuidv4();
-    urlCache.set(cacheId, { videoUrl, streamUrl });
+    saveCache(cacheId, { videoUrl, streamUrl });
 
     // Mã hóa cacheId
     const encodedCacheId = encodeBase64(cacheId);
@@ -184,7 +321,7 @@ app.get(API_PATH_URL, async (req, res) => {
     try {
       const { stream, id, title, thumbnail } = await fetchWithProxy(videoUrl);
       const cacheId = uuidv4();
-      urlCache.set(cacheId, { videoUrl, streamUrl: null });
+      saveCache(cacheId, { videoUrl, streamUrl: null });
 
       // Mã hóa cacheId
       const encodedCacheId = encodeBase64(cacheId);
@@ -220,19 +357,19 @@ app.get('/get-stream/:id', async (req, res) => {
     return res.status(400).json({ error: 'INVALID_ENCODED_ID' });
   }
 
-  const entry = urlCache.get(id);
+  getCache(id, (entry) => {
+    if (!entry) {
+      return res.status(404).json({ error: 'VIRTUAL_LINK_NOT_FOUND' });
+    }
 
-  if (!entry) {
-    return res.status(404).json({ error: 'VIRTUAL_LINK_NOT_FOUND' });
-  }
-
-  // Tạo link ảo đầy đủ với cacheId đã mã hóa
-  const virtualLink = `${req.protocol}://${req.headers.host}${STREAM_PATH_URL}/${encodedId}`;
-  return res.json({ streamUrl: virtualLink });
+    // Tạo link ảo đầy đủ với cacheId đã mã hóa
+    const virtualLink = `${req.protocol}://${req.headers.host}${STREAM_PATH_URL}/${encodedId}`;
+    return res.json({ streamUrl: virtualLink });
+  });
 });
 
 // Route stream video từ link ảo
-app.get(STREAM_PATH_URL + '/:id', async (req, res) => {
+app.get(STREAM_PATH_URL + '/:id', concurrentLimitMiddleware, async (req, res) => {
   const encodedId = req.params.id;
   let id;
   try {
@@ -242,44 +379,44 @@ app.get(STREAM_PATH_URL + '/:id', async (req, res) => {
     return res.status(400).json({ error: 'INVALID_ENCODED_ID' });
   }
 
-  const entry = urlCache.get(id);
-
-  if (!entry) {
-    return res.status(404).json({ error: 'VIRTUAL_LINK_NOT_FOUND' });
-  }
-
-  const { videoUrl, streamUrl } = entry;
-
-  try {
-    if (streamUrl) {
-      // Sử dụng streamUrl từ yt-dlp nếu có
-      console.log('[Main] Using cached stream URL for ID:', id);
-      const cookieContent = parseCookies(COOKIES_PATH);
-      const response = await axios.get(streamUrl, {
-        responseType: 'stream',
-        headers: {
-          'User-Agent': TIKTOK_USER_AGENT,
-          'Referer': 'https://www.tiktok.com/',
-          'Cookie': cookieContent,
-          'Accept': 'video/mp4',
-        },
-      });
-      res.setHeader('Content-Type', 'video/mp4');
-      response.data.pipe(res);
-    } else {
-      // Fallback: Proxy trực tiếp
-      console.log('[Main] Attempting proxy method for ID:', id);
-      const { stream } = await fetchWithProxy(videoUrl);
-      res.setHeader('Content-Type', 'video/mp4');
-      stream.pipe(res);
+  getCache(id, async (entry) => {
+    if (!entry) {
+      return res.status(404).json({ error: 'VIRTUAL_LINK_NOT_FOUND' });
     }
-  } catch (error) {
-    console.error('[Main] Streaming failed for ID:', id, error.message);
-    res.status(500).json({
-      error: 'STREAMING_FAILED',
-      details: error.message,
-    });
-  }
+
+    const { videoUrl, streamUrl } = entry;
+
+    try {
+      if (streamUrl) {
+        // Sử dụng streamUrl từ yt-dlp nếu có
+        console.log('[Main] Using cached stream URL for ID:', id);
+        const cookieContent = parseCookies(COOKIES_PATH);
+        const response = await axios.get(streamUrl, {
+          responseType: 'stream',
+          headers: {
+            'User-Agent': TIKTOK_USER_AGENT,
+            'Referer': 'https://www.tiktok.com/',
+            'Cookie': cookieContent,
+            'Accept': 'video/mp4',
+          },
+        });
+        res.setHeader('Content-Type', 'video/mp4');
+        response.data.pipe(res);
+      } else {
+        // Fallback: Proxy trực tiếp
+        console.log('[Main] Attempting proxy method for ID:', id);
+        const { stream } = await fetchWithProxy(videoUrl);
+        res.setHeader('Content-Type', 'video/mp4');
+        stream.pipe(res);
+      }
+    } catch (error) {
+      console.error('[Main] Streaming failed for ID:', id, error.message);
+      res.status(500).json({
+        error: 'STREAMING_FAILED',
+        details: error.message,
+      });
+    }
+  });
 });
 
 // Kiểm tra yt-dlp có sẵn không
