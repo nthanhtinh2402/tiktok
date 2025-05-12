@@ -5,17 +5,24 @@ import { readFileSync, existsSync } from 'fs';
 import { fileURLToPath } from 'url';
 import { dirname, join } from 'path';
 import pkg from 'uuid';
+import dotenv from 'dotenv';
+
+// Load biến môi trường từ file .env
+dotenv.config();
+
 const { v4: uuidv4 } = pkg;
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 
 const app = express();
-const port = 5000;
+const port = process.env.PORT || 5000;
 
 // Cấu hình
-const TIKTOK_USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)';
-const COOKIES_PATH = join(__dirname, 'cookies.txt');
+const TIKTOK_USER_AGENT = process.env.TIKTOK_USER_AGENT;
+const COOKIES_PATH = join(__dirname, process.env.COOKIES_PATH);
+const API_PATH_URL = process.env.API_PATH_URL || '/video'; // Sử dụng API_PATH_URL từ .env
+const STREAM_PATH_URL = process.env.STREAM_PATH_URL || '/stream'; // Sử dụng STREAM_PATH_URL từ .env
 
 // Lưu trữ ánh xạ id -> { videoUrl, streamUrl } (bộ nhớ tạm)
 const urlCache = new Map();
@@ -59,7 +66,7 @@ const parseCookies = (filePath) => {
 };
 
 // Hàm retry
-const retry = async (fn, retries = 2, delay = 1000) => {
+const retry = async (fn, retries = process.env.RETRY_ATTEMPTS || 2, delay = process.env.RETRY_DELAY || 1000) => {
   for (let i = 0; i < retries; i++) {
     try {
       return await fn();
@@ -75,7 +82,7 @@ const retry = async (fn, retries = 2, delay = 1000) => {
 const fetchWithYTDLP = async (videoUrl) => {
   return new Promise((resolve, reject) => {
     const command = [
-      'yt-dlp',
+      process.env.YTDLP_COMMAND,  // Lấy từ biến môi trường
       '--dump-json',
       `"${videoUrl}"`,
       '--no-warnings',
@@ -147,7 +154,7 @@ const encodeBase64 = (str) => Buffer.from(str).toString('base64');
 const decodeBase64 = (str) => Buffer.from(str, 'base64').toString('utf-8');
 
 // Route trả về thông tin video
-app.get('/video', async (req, res) => {
+app.get(API_PATH_URL, async (req, res) => {
   const videoUrl = req.query.url;
 
   // Kiểm tra URL hợp lệ
@@ -168,8 +175,8 @@ app.get('/video', async (req, res) => {
     // Mã hóa cacheId
     const encodedCacheId = encodeBase64(cacheId);
 
-    // Tạo link download đầy đủ với cacheId đã mã hóa
-    const linkDownload = `${req.protocol}://${req.headers.host}/stream/${encodedCacheId}`;
+    // Tạo link download đầy đủ với cacheId đã mã hóa và streamPath từ .env
+    const linkDownload = `${req.protocol}://${req.headers.host}${STREAM_PATH_URL}/${encodedCacheId}`;
 
     return res.json({ id, title, thumbnail, cacheId, linkDownload });
   } catch (ytDlpError) {
@@ -182,8 +189,8 @@ app.get('/video', async (req, res) => {
       // Mã hóa cacheId
       const encodedCacheId = encodeBase64(cacheId);
 
-      // Tạo link download đầy đủ với cacheId đã mã hóa
-      const linkDownload = `${req.protocol}://${req.headers.host}/stream/${encodedCacheId}`;
+      // Tạo link download đầy đủ với cacheId đã mã hóa và streamPath từ .env
+      const linkDownload = `${req.protocol}://${req.headers.host}${STREAM_PATH_URL}/${encodedCacheId}`;
 
       return res.json({ id, title, thumbnail, cacheId, linkDownload });
     } catch (proxyError) {
@@ -220,12 +227,12 @@ app.get('/get-stream/:id', async (req, res) => {
   }
 
   // Tạo link ảo đầy đủ với cacheId đã mã hóa
-  const virtualLink = `${req.protocol}://${req.headers.host}/stream/${encodedId}`;
+  const virtualLink = `${req.protocol}://${req.headers.host}${STREAM_PATH_URL}/${encodedId}`;
   return res.json({ streamUrl: virtualLink });
 });
 
 // Route stream video từ link ảo
-app.get('/stream/:id', async (req, res) => {
+app.get(STREAM_PATH_URL + '/:id', async (req, res) => {
   const encodedId = req.params.id;
   let id;
   try {
