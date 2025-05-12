@@ -161,14 +161,21 @@ app.get('/video', async (req, res) => {
     const cacheId = uuidv4();
     urlCache.set(cacheId, { videoUrl, streamUrl });
 
-    return res.json({ id, title, thumbnail, cacheId });
+    // Tạo link download đầy đủ
+    const linkDownload = `${req.protocol}://${req.headers.host}/stream/${cacheId}`;
+
+    return res.json({ id, title, thumbnail, cacheId, linkDownload });
   } catch (ytDlpError) {
     console.log('[Fallback] Switching to proxy method...');
     try {
       const { stream, id, title, thumbnail } = await fetchWithProxy(videoUrl);
       const cacheId = uuidv4();
       urlCache.set(cacheId, { videoUrl, streamUrl: null });
-      return res.json({ id, title, thumbnail, cacheId });
+
+      // Tạo link download đầy đủ
+      const linkDownload = `${req.protocol}://${req.headers.host}/stream/${cacheId}`;
+
+      return res.json({ id, title, thumbnail, cacheId, linkDownload });
     } catch (proxyError) {
       console.error('[Main] All methods failed:', {
         ytDlpError: ytDlpError.message,
